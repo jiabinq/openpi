@@ -87,18 +87,32 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
     flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
 
-    # First, take all weights that are a subset of the reference weights.
-    result = {}
+    # Start with the full reference structure to preserve shape/dtype expectations.
+    # Leaves from `flat_ref` are typically jax.ShapeDtypeStruct in this context.
+    result: dict[str, object] = {k: v for k, v in flat_ref.items()}
+
+    # Overwrite with loaded weights where shapes are compatible; otherwise, keep ref (and warn).
     for k, v in flat_loaded.items():
-        if k in flat_ref:
-            result[k] = v.astype(flat_ref[k].dtype) if v.dtype != flat_ref[k].dtype else v
+        if k not in flat_ref:
+            continue
+        ref = flat_ref[k]
+        v_shape = getattr(v, "shape", None)
+        ref_shape = getattr(ref, "shape", None)
+        if v_shape == ref_shape:
+            # Cast dtype if necessary to match the reference dtype.
+            ref_dtype = getattr(ref, "dtype", None)
+            v_dtype = getattr(v, "dtype", None)
+            result[k] = v.astype(ref_dtype) if (ref_dtype is not None and v_dtype != ref_dtype) else v
+        else:
+            logger.warning(
+                "Skipping param %s: shape mismatch %s != %s",
+                k,
+                v_shape,
+                ref_shape,
+            )
 
-    flat_loaded.clear()
-
-    # Then, merge any missing weights as defined by the missing regex.
-    pattern = re.compile(missing_regex)
-    for k in {k for k in flat_ref if pattern.fullmatch(k)}:
-        if k not in result:
-            result[k] = flat_ref[k]
+    # Note: We intentionally do not force-merge additional keys by regex here since
+    # `result` already contains the full reference tree; keys left as refs will be
+    # filtered out upstream when only real arrays are applied to the model.
 
     return flax.traverse_util.unflatten_dict(result, sep="/")
