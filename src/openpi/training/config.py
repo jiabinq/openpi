@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.so100_policy as so100_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -351,6 +352,41 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotClearTrayDataConfig(DataConfigFactory):
+    """Config for the custom SO-100 'clear_tray' dataset."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform is not needed since our policy directly uses the keys
+        # from the dataset.
+        repack_transform = _transforms.Group()
+
+        # Use the SO100 toolkit we defined in so100_policy.py
+        data_transforms = _transforms.Group(
+            inputs=[so100_policy.S0100Inputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[so100_policy.S0100Outputs()],
+        )
+
+        # Apply delta actions to the 5 joints, but not the gripper.
+        delta_action_mask = _transforms.make_bool_mask(5, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        # Model transforms are standard (e.g., tokenizing prompts).
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
         )
 
 
@@ -819,6 +855,28 @@ _CONFIGS = [
     #
     # Fine-tuning DROID configs.
     #
+    #
+    # Custom SO-100 config for clear_tray dataset.
+    #
+    TrainConfig(
+        name="pi05_clear_tray_fine_tune",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=6),
+        data=LeRobotClearTrayDataConfig(
+            repo_id="JiabinQ/clear_tray_3cam",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=30_000,
+        batch_size=64,
+    ),
     TrainConfig(
         # This config is for fine-tuning pi0-FAST-base on the *full* DROID dataset.
         # We use RLDS data loading to make training on this large dataset tractable.
