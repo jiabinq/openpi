@@ -21,7 +21,7 @@ Your local clone is likely configured to point to the original `openpi` reposito
 
 ```bash
 # Replace <YOUR_GITHUB_USERNAME> with your actual username
-git remote set-url origin https://github.com/<YOUR_GITHUB_USERNAME>/openpi.git
+git remote set-url origin https://github.com/jiabinq/openpi.git
 ```
 
 #### C. Commit and Push Your Local Changes
@@ -33,7 +33,7 @@ Now, commit the changes you've made locally and push them to your fork.
 git add .
 
 # Commit them with a descriptive message
-git commit -m "My local changes for AutoDL training"
+git commit -m "Added Single Arm SO100"
 
 # Push the commit to your fork's main branch
 git push origin main
