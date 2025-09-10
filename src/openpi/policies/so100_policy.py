@@ -46,16 +46,33 @@ class S0100Inputs(transforms.DataTransformFn):
         side_image = _parse_image(data["observation.images.side"])
 
         # Map the dataset cameras to the logical cameras the model expects.
-        images = {
-            "base_0_rgb": top_image,
-            "left_wrist_0_rgb": wrist_image,
-            "right_wrist_0_rgb": side_image,
-        }
-        image_masks = {
-            "base_0_rgb": np.True_,
-            "left_wrist_0_rgb": np.True_,
-            "right_wrist_0_rgb": np.True_,
-        }
+        match self.model_type:
+            case _model.ModelType.PI0 | _model.ModelType.PI05:
+                # PI0 and PI0.5 use same image layout
+                images = {
+                    "base_0_rgb": top_image,
+                    "left_wrist_0_rgb": wrist_image,
+                    "right_wrist_0_rgb": side_image,
+                }
+                image_masks = {
+                    "base_0_rgb": np.True_,
+                    "left_wrist_0_rgb": np.True_,
+                    "right_wrist_0_rgb": np.True_,
+                }
+            case _model.ModelType.PI0_FAST:
+                # PI0_FAST uses different image naming/layout
+                images = {
+                    "base_0_rgb": top_image,
+                    "base_1_rgb": side_image,
+                    "wrist_0_rgb": wrist_image,
+                }
+                image_masks = {
+                    "base_0_rgb": np.True_,
+                    "base_1_rgb": np.True_,
+                    "wrist_0_rgb": np.True_,
+                }
+            case _:
+                raise ValueError(f"Unsupported model type: {self.model_type}")
 
         inputs = {
             "state": state,
