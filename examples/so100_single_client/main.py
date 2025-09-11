@@ -41,7 +41,8 @@ class Args:
 
     # Control
     freq_hz: int = 30
-    action_horizon: int = 10
+    # Match the model's action_horizon (pi05 default typically 50)
+    action_horizon: int = 50
     prompt: str = "Pick up the object"
 
     # Robot I/O mode
@@ -50,14 +51,29 @@ class Args:
     # - "none": no robot I/O, just print actions
     io_mode: str = "none"
     http_url: str = "http://localhost:80"
+    robot_port: str = "/dev/ttyACM0"  # Robot serial port for lerobot mode
+    # Logical robot identifier used by LeRobot to locate calibration and configs.
+    # This maps to SO101FollowerConfig(id=...). Defaults to "so101".
+    robot_id: str = "so101"
     use_degrees: bool = False  # applies to lerobot mode; if True, convert deg->rad for policy state
+
+    # State validation / mapping (client-side)
+    # Units used for the incoming robot state; if "deg", convert first 5 joints to radians.
+    state_units: str = "rad"  # one of {"rad", "deg"}
+    # Mapping from robot joint order -> model joint order, as comma-separated indices (e.g., "0,1,2,3,4,5").
+    state_order: str = "0,1,2,3,4,5"
+    # Per-joint limits (radians) for first 5 joints: semicolon-separated pairs, e.g.,
+    # "(-2.5,2.5);(-2.5,2.5);(-2.5,2.5);(-2.5,2.5);(-3.14,3.14)". If empty, no clamp applied.
+    state_joint_limits: str | None = None
+    # Gripper limits as a single pair, e.g., "(0,1)" or "(0,100)". If empty, no clamp applied.
+    state_gripper_limits: str | None = None
 
 
 def _init_cameras(args: Args):
     import cv2
 
     caps = {}
-    for name, idx in {"top": args.top_cam, "wrist": args.wrist_cam}.items():
+    for name, idx in {"top": args.top_cam, "wrist": args.wrist_cam, "side": args.side_cam}.items():
         cap = cv2.VideoCapture(int(idx))
         if not cap.isOpened():
             raise RuntimeError(f"Camera {name} (index {idx}) failed to open")
@@ -101,22 +117,52 @@ class _HTTPRobotIO(_RobotIOBase):
         self._client.post(f"{self._base}/joints/write", json={"angles": action_rad.tolist()}).raise_for_status()
 
 
-class _LeRobotSO101IO(_RobotIOBase):
-    def __init__(self, use_degrees: bool) -> None:
-        # Lazy import to avoid hard dependency when not used
-        from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
+def _build_lerobot_robot(*, robot_id: str, port: str, use_degrees: bool):
+    """
+    Construct a LeRobot SO101 follower using the new public API when available,
+    falling back to the legacy API if needed.
+    """
+    # Try new factory-style API first: typed config + factory
+    try:
+        from lerobot.robots import make_robot_from_config  # type: ignore
+        from lerobot.robots.so101_follower import SO101FollowerConfig as _SO101Cfg  # type: ignore
 
-        # Minimal config: adjust port/cameras via your own config file if needed.
-        # Here we rely on default camera configs defined externally.
-        # You may need to adapt this to your environment.
-        # This class assumes the robot object is already configured to access cameras elsewhere, we only use joints here.
-        self._cfg = SO101FollowerConfig(
-            id="so101",
-            port="/dev/ttyUSB0",
+        cfg = _SO101Cfg(
+            id=robot_id,
+            port=port,
             cameras={},
             use_degrees=use_degrees,
         )
-        self._robot = SO101Follower(self._cfg)
+        robot = make_robot_from_config(cfg)
+        logging.info("LeRobot: using new robots API (typed SO101FollowerConfig + factory)")
+        return robot
+    except Exception as e_new:
+        # Fallback to legacy direct classes
+        try:
+            from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig  # type: ignore
+
+            cfg = SO101FollowerConfig(
+                id=robot_id,
+                port=port,
+                cameras={},
+                use_degrees=use_degrees,
+            )
+            robot = SO101Follower(cfg)
+            logging.info("LeRobot: using legacy robots API (SO101Follower)")
+            return robot
+        except Exception as e_old:
+            raise ModuleNotFoundError(
+                "LeRobot APIs not available for --io-mode lerobot.\n"
+                "- Install LeRobot in this environment (e.g., 'GIT_LFS_SKIP_SMUDGE=1 uv sync' or 'uv pip install lerobot').\n"
+                "- Newer LeRobot moved modules; this client supports both new and old APIs.\n"
+                f"New API error: {e_new}\nOld API error: {e_old}"
+            )
+
+
+class _LeRobotSO101IO(_RobotIOBase):
+    def __init__(self, *, robot_id: str, use_degrees: bool, robot_port: str) -> None:
+        # Build robot via compatibility builder
+        self._robot = _build_lerobot_robot(robot_id=robot_id, port=robot_port, use_degrees=use_degrees)
         self._robot.connect()
         self._deg = use_degrees
 
@@ -161,8 +207,74 @@ def _make_robot_io(args: Args) -> Optional[_RobotIOBase]:
     if mode == "http":
         return _HTTPRobotIO(args.http_url)
     if mode == "lerobot":
-        return _LeRobotSO101IO(use_degrees=args.use_degrees)
+        return _LeRobotSO101IO(robot_id=args.robot_id, use_degrees=args.use_degrees, robot_port=args.robot_port)
     raise ValueError(f"Unsupported io_mode: {args.io_mode}")
+
+
+def _parse_order(order_str: str) -> list[int]:
+    parts = [p.strip() for p in order_str.split(',') if p.strip() != ""]
+    try:
+        order = [int(p) for p in parts]
+    except Exception as e:
+        raise ValueError(f"Invalid state_order: {order_str!r}") from e
+    if len(order) != 6 or sorted(order) != [0, 1, 2, 3, 4, 5]:
+        raise ValueError(f"Invalid state_order length/permutation: {order_str!r}")
+    return order
+
+
+def _parse_limits_list(lims: str, expected_len: int) -> list[tuple[float, float]]:
+    entries = [e.strip() for e in lims.split(';') if e.strip()]
+    pairs: list[tuple[float, float]] = []
+    for e in entries:
+        if not (e.startswith('(') and e.endswith(')')):
+            raise ValueError(f"Invalid limits entry: {e!r}")
+        lo, hi = e[1:-1].split(',')
+        pairs.append((float(lo), float(hi)))
+    if len(pairs) != expected_len:
+        raise ValueError(f"Expected {expected_len} joint limit entries, got {len(pairs)}")
+    return pairs
+
+
+def _parse_limits_pair(lims: str) -> tuple[float, float]:
+    s = lims.strip()
+    if not (s.startswith('(') and s.endswith(')')):
+        raise ValueError(f"Invalid gripper limits: {lims!r}")
+    lo, hi = s[1:-1].split(',')
+    return float(lo), float(hi)
+
+
+def _validate_and_convert_state(
+    state: np.ndarray,
+    *,
+    units: str,
+    order: list[int],
+    joint_limits: list[tuple[float, float]] | None,
+    gripper_limits: tuple[float, float] | None,
+) -> np.ndarray:
+    arr = np.asarray(state, dtype=np.float32).reshape(-1)
+    if arr.shape[0] != 6:
+        raise ValueError(f"Expected state of length 6, got shape {arr.shape}")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("State contains non-finite values")
+
+    out = arr.copy()
+    if units.lower() == "deg":
+        out[:5] = np.deg2rad(out[:5])
+    elif units.lower() != "rad":
+        raise ValueError(f"Unsupported state_units: {units!r}")
+
+    if order != [0, 1, 2, 3, 4, 5]:
+        out = out[np.asarray(order, dtype=np.int32)]
+
+    if joint_limits is not None:
+        for i in range(5):
+            lo, hi = joint_limits[i]
+            out[i] = float(np.clip(out[i], lo, hi))
+    if gripper_limits is not None:
+        lo, hi = gripper_limits
+        out[5] = float(np.clip(out[5], lo, hi))
+
+    return out.astype(np.float32)
 
 
 def main(args: Args) -> None:
@@ -180,10 +292,19 @@ def main(args: Args) -> None:
     robot = _make_robot_io(args)
 
     # Warmup: read once to ensure server loads
+    # Validate a zero-state using the same pipeline for consistency
+    zero_state = _validate_and_convert_state(
+        np.zeros(6, dtype=np.float32),
+        units=args.state_units,
+        order=_parse_order(args.state_order),
+        joint_limits=_parse_limits_list(args.state_joint_limits, 5) if args.state_joint_limits else None,
+        gripper_limits=_parse_limits_pair(args.state_gripper_limits) if args.state_gripper_limits else None,
+    )
     obs = {
-        "observation/state": np.zeros(6, dtype=np.float32),
-        "observation/images.main.left": _resize_uint8(_read_rgb_bgr(caps["top"]), args.height, args.width),
-        "observation/images.secondary_0": _resize_uint8(_read_rgb_bgr(caps["wrist"]), args.height, args.width),
+        "observation.state": zero_state,
+        "observation.images.top": _resize_uint8(_read_rgb_bgr(caps["top"]), args.height, args.width),
+        "observation.images.wrist": _resize_uint8(_read_rgb_bgr(caps["wrist"]), args.height, args.width),
+        "observation.images.side": _resize_uint8(_read_rgb_bgr(caps["side"]), args.height, args.width),
         "prompt": args.prompt,
     }
     _ = broker.infer(obs)
@@ -197,17 +318,31 @@ def main(args: Args) -> None:
             # Read cameras
             img_top = _resize_uint8(_read_rgb_bgr(caps["top"]), args.height, args.width)
             img_wrist = _resize_uint8(_read_rgb_bgr(caps["wrist"]), args.height, args.width)
+            img_side = _resize_uint8(_read_rgb_bgr(caps["side"]), args.height, args.width)
 
             # Read state
             if robot is not None:
-                state = robot.read_state_rad()
+                raw_state = robot.read_state_rad()
             else:
+                raw_state = np.zeros(6, dtype=np.float32)
+
+            try:
+                state = _validate_and_convert_state(
+                    raw_state,
+                    units=args.state_units,
+                    order=_parse_order(args.state_order),
+                    joint_limits=_parse_limits_list(args.state_joint_limits, 5) if args.state_joint_limits else None,
+                    gripper_limits=_parse_limits_pair(args.state_gripper_limits) if args.state_gripper_limits else None,
+                )
+            except Exception as e:
+                logging.warning("Invalid state %s; using zeros. Error: %s", raw_state, e)
                 state = np.zeros(6, dtype=np.float32)
 
             obs = {
-                "observation/state": state,
-                "observation/images.main.left": img_top,
-                "observation/images.secondary_0": img_wrist,
+                "observation.state": state,
+                "observation.images.top": img_top,
+                "observation.images.wrist": img_wrist,
+                "observation.images.side": img_side,
                 "prompt": args.prompt,
             }
 
@@ -241,5 +376,5 @@ def main(args: Args) -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, force=True)
-    tyro.cli(main)
-
+    args = tyro.cli(Args)
+    main(args)
