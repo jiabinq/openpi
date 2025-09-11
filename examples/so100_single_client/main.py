@@ -186,8 +186,6 @@ class _LeRobotSO101IO(_RobotIOBase):
     def send_action(self, action_rad: np.ndarray) -> None:
         # Convert back to robot units
         act = np.asarray(action_rad, dtype=np.float32).copy()
-        if self._deg:
-            act[:5] = np.rad2deg(act[:5])
         # Map to robot action dictionary
         cmd = {
             "shoulder_pan.pos": float(act[0]),
