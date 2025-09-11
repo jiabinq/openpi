@@ -168,15 +168,28 @@ class Unnormalize(DataTransformFn):
         )
 
     def _unnormalize(self, x, stats: NormStats):
-        mean = pad_to_dim(stats.mean, x.shape[-1], axis=-1, value=0.0)
-        std = pad_to_dim(stats.std, x.shape[-1], axis=-1, value=1.0)
-        return x * (std + 1e-6) + mean
+        x_dim = x.shape[-1]
+        stats_dim = stats.mean.shape[-1]
+        if stats_dim > x_dim:
+            mean = stats.mean[..., :x_dim]
+            std = stats.std[..., :x_dim]
+            return x * (std + 1e-6) + mean
+        elif stats_dim < x_dim:
+            mean = pad_to_dim(stats.mean, x_dim, axis=-1, value=0.0)
+            std = pad_to_dim(stats.std, x_dim, axis=-1, value=1.0)
+            return x * (std + 1e-6) + mean
+        else:
+            return x * (stats.std + 1e-6) + stats.mean
 
     def _unnormalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
         q01, q99 = stats.q01, stats.q99
-        if (dim := q01.shape[-1]) < x.shape[-1]:
+        x_dim = x.shape[-1]
+        dim = q01.shape[-1]
+        if dim > x_dim:
+            return (x + 1.0) / 2.0 * (q99[..., :x_dim] - q01[..., :x_dim] + 1e-6) + q01[..., :x_dim]
+        if dim < x_dim:
             return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
         return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
 
