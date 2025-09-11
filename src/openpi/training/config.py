@@ -866,9 +866,9 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
+            # Use local 6‑D norm stats computed for this config
             assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
-                asset_id="trossen",
+                asset_id="JiabinQ/clear_tray_3cam",
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
